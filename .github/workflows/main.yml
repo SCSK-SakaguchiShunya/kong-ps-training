@@ -1,0 +1,144 @@
+name: scan-kong-gateway
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "スキャンするタグ (カンマ区切り, 例: 3.10,3.11)"
+        required: false
+        default: "3.11"
+      severity_cutoff:
+        description: "Trivy の失敗閾値 (例: HIGH,CRITICAL)"
+        required: false
+        default: "HIGH,CRITICAL"
+
+env:
+  BASE_IMAGE_REPO: kong/kong-gateway
+  TRIVY_CACHE_DIR: .trivycache
+  AWS_REGION: ap-northeast-1
+  ECR_REPOSITORY: kong-gateway-mirror
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write
+
+jobs:
+  trivy-scan:
+    name: Trivy Scan (Official Image)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJson(format('["{0}"]', github.event.inputs.tags || '3.11')) }}
+    steps:
+      - name: Prepare tags list (comma → matrix)
+        id: prep
+        run: |
+          INPUT="${{ github.event.inputs.tags || '3.11' }}"
+          # 余計な空白除去
+          LIST=$(echo "$INPUT" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | sort -u | paste -sd ',')
+          echo "list=$LIST" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Expand matrix dynamically
+        if: ${{ false }}
+        run: echo "(ダミーステップ: matrix は上部定義で処理)"
+
+      - name: Pull image
+        run: |
+          docker pull ${BASE_IMAGE_REPO}:${{ matrix.tag }}
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure ECR Repository
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "$ECR_REPOSITORY" \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Restore Trivy cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TRIVY_CACHE_DIR }}
+          key: trivy-${{ runner.os }}-${{ matrix.tag }}
+          restore-keys: |
+            trivy-${{ runner.os }}-
+
+      - name: Trivy scan (fail on cutoff)
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${BASE_IMAGE_REPO}:${{ matrix.tag }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: ${{ github.event.inputs.severity_cutoff || 'HIGH,CRITICAL' }}
+          cache-dir: ${{ env.TRIVY_CACHE_DIR }}
+
+      - name: Generate SARIF (all severities)
+        if: always()
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${BASE_IMAGE_REPO}:${{ matrix.tag }}
+            
+          format: 'sarif'
+          output: trivy-${{ matrix.tag }}.sarif
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          cache-dir: ${{ env.TRIVY_CACHE_DIR }}
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.tag }}.sarif
+
+      - name: Tag & Push to ECR (only if scan passed)
+        if: success()
+        run: |
+          MIRROR_TAG=${{ matrix.tag }}
+          SRC=${BASE_IMAGE_REPO}:${{ matrix.tag }}
+          DST=${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:${{ matrix.tag }}
+          docker tag "$SRC" "$DST"
+          docker push "$DST"
+          DIGEST=$(aws ecr describe-images --repository-name $ECR_REPOSITORY --image-ids imageTag=${{ matrix.tag }} --query 'imageDetails[0].imageDigest' --output text)
+          echo "DIGEST=$DIGEST" >> $GITHUB_ENV
+          echo "ECR_IMAGE=$DST" >> $GITHUB_ENV
+
+      - name: Generate values override (artifact)
+        if: success()
+        run: |
+          cat > values-image-${{ matrix.tag }}.yaml <<EOF
+          image:
+            repository: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY
+            tag: "${{ matrix.tag }}"
+            digest: "${DIGEST}"
+            pullPolicy: IfNotPresent
+          EOF
+
+      - name: Upload values artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: values-image-${{ matrix.tag }}
+          path: values-image-${{ matrix.tag }}.yaml
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "Tag: ${{ matrix.tag }} Scan Status: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "ECR Image: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:${{ matrix.tag }}" >> $GITHUB_STEP_SUMMARY
+          fi
