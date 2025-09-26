@@ -128,7 +128,17 @@ jobs:
               --cache-dir "$TRIVY_CACHE_DIR" \
               "${BASE_IMAGE_REPO}:$tag" || true
 
-            if ! grep -q "scan_failed $tag" "$FAILED_FILE"; then
+            # スキャンに失敗したタグはミラーしない (安全側運用)
+            if grep -q "scan_failed $tag" "$FAILED_FILE"; then
+              echo "Skipping mirror for $tag due to failed scan" | tee -a "$SUMMARY_FILE"
+              {
+                echo 'image:'
+                echo "  repository: $BASE_IMAGE_REPO"
+                echo "  tag: \"$tag\""
+                echo '  pullPolicy: IfNotPresent'
+                echo '  # NOTE: scan failed -> not mirrored to ECR'
+              } > "artifacts/values-image-$tag.yaml"
+            else
               if [ "${MIRROR_DISABLED:-0}" = "0" ]; then
                 DST="$ECR_REGISTRY/$ECR_REPOSITORY:$tag"
                 docker tag "${BASE_IMAGE_REPO}:$tag" "$DST"
@@ -140,7 +150,6 @@ jobs:
                     --query 'imageDetails[0].imageDigest' \
                     --output text)
                   echo "Tag $tag digest $DIGEST" | tee -a "$SUMMARY_FILE"
-
                   {
                     echo 'image:'
                     echo "  repository: $ECR_REGISTRY/$ECR_REPOSITORY"
@@ -148,7 +157,6 @@ jobs:
                     echo "  digest: \"$DIGEST\""
                     echo '  pullPolicy: IfNotPresent'
                   } > "artifacts/values-image-$tag.yaml"
-
                 else
                   echo "push_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
                   overall_status=1
@@ -160,6 +168,7 @@ jobs:
                   echo "  repository: $BASE_IMAGE_REPO"
                   echo "  tag: \"$tag\""
                   echo '  pullPolicy: IfNotPresent'
+                  echo '  # NOTE: scan passed but mirror disabled'
                 } > "artifacts/values-image-$tag.yaml"
               fi
             fi
