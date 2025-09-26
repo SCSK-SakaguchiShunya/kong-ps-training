@@ -38,7 +38,6 @@ jobs:
           echo "TAGS=$LIST" >> "$GITHUB_ENV"
           echo "Normalized tags: $LIST"
 
-      # キャッシュキーをTrivyのバージョンに修正し、より適切にしました
       - name: Setup Trivy Cache
         uses: actions/cache@v4
         with:
@@ -51,7 +50,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Installing Trivy ${TRIVY_VERSION}"
-          curl -sSL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-6bit.tar.gz"
           tar zxvf trivy.tgz trivy >/dev/null 2>&1
           sudo mv trivy /usr/local/bin/
           trivy --version
@@ -85,14 +84,12 @@ jobs:
         if: env.MIRROR_DISABLED != '1'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
-      
-      # ACCOUNT_IDの取得は不要なので削除 (ECRログインアクションの出力で十分なため)
 
       - name: Scan & Mirror loop
         id: loop
         env:
           SEVERITY: ${{ github.event.inputs.severity_cutoff || 'HIGH,CRITICAL' }}
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }} # ECRのレジストリURLを環境変数として渡す
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
           set -euo pipefail
           mkdir -p artifacts sarif
@@ -110,7 +107,6 @@ jobs:
             fi
 
             echo "Scanning ${BASE_IMAGE_REPO}:$tag"
-            # 脆弱性スキャンを実行し、閾値を超えたら失敗させる
             if ! trivy image \
               --ignore-unfixed \
               --severity "$SEVERITY" \
@@ -118,13 +114,11 @@ jobs:
               --vuln-type os,library \
               --cache-dir "$TRIVY_CACHE_DIR" \
               "${BASE_IMAGE_REPO}:$tag"; then
-              # スキャン失敗の記録
               echo "scan_failed $tag (vulnerabilities found)" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
               overall_status=1
             fi
 
             echo "Generating SARIF for $tag" | tee -a "$SUMMARY_FILE"
-            # スキャン結果に関わらず、常にSARIFレポートを生成する
             trivy image \
               --ignore-unfixed \
               --format sarif \
@@ -134,16 +128,13 @@ jobs:
               --cache-dir "$TRIVY_CACHE_DIR" \
               "${BASE_IMAGE_REPO}:$tag" || true
 
-            # スキャンに合格した場合のみプッシュ処理を行う
             if ! grep -q "scan_failed $tag" "$FAILED_FILE"; then
-              # ミラーリングが有効な場合
               if [ "${MIRROR_DISABLED:-0}" = "0" ]; then
                 DST="$ECR_REGISTRY/$ECR_REPOSITORY:$tag"
                 docker tag "${BASE_IMAGE_REPO}:$tag" "$DST"
                 
                 echo "Pushing to ECR: $DST"
                 if docker push "$DST"; then
-                  # プッシュ成功後、ダイジェストを取得
                   DIGEST=$(aws ecr describe-images \
                     --repository-name "$ECR_REPOSITORY" \
                     --image-ids imageTag=$tag \
@@ -151,28 +142,21 @@ jobs:
                     --output text)
                   echo "Tag $tag digest $DIGEST" | tee -a "$SUMMARY_FILE"
 
-                  # Artifact用のYAMLファイルを生成
                   cat > "artifacts/values-image-$tag.yaml" <<EOF
 image:
-  # ミラー済み ECR リポジトリ (スキャン合格)
   repository: $ECR_REGISTRY/$ECR_REPOSITORY
-  # スキャン合格タグ
   tag: "$tag"
-  # 再現性確保のため digest を優先利用
   digest: "$DIGEST"
   pullPolicy: IfNotPresent
 EOF
                 else
-                  # プッシュ失敗の記録
                   echo "push_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
                   overall_status=1
                 fi
               else
-                # ミラーリング無効時 (スキャンのみ)
                 echo "mirror_skipped $tag (scan-only mode)" | tee -a "$SUMMARY_FILE"
                 cat > "artifacts/values-image-$tag.yaml" <<EOF
 image:
-  # フォールバック (ECR ミラー無効) 公式イメージ参照
   repository: $BASE_IMAGE_REPO
   tag: "$tag"
   pullPolicy: IfNotPresent
@@ -183,16 +167,14 @@ EOF
 
           echo "OVERALL_STATUS=$overall_status" >> "$GITHUB_ENV"
 
-      # ループではなく、公式アクションでsarifディレクトリを直接指定して一括アップロードする
       - name: Upload SARIF results
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
-          # sarif/ ディレクトリ配下の全 .sarif ファイルをアップロード
           sarif_file: sarif
         
       - name: Upload values artifacts (bundle)
-        if: success() # ジョブ全体が成功した場合のみアーティファクトをアップロード
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: values-images
