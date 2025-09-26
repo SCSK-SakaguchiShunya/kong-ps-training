@@ -51,24 +51,30 @@ jobs:
           test -f values-golden.yaml || { echo 'values-golden.yaml not found' >&2; exit 1; }
           echo '--- values-golden.yaml (first 120 lines) ---'
           sed -n '1,120p' values-golden.yaml
-          REPO=$(yq '.image.repository // empty' values-golden.yaml)
-          TAG=$(yq '.image.tag // empty' values-golden.yaml)
-          # 優先順位: workflow_dispatch 入力 image-digest > 環境変数 IMAGE_DIGEST > values-golden.yaml 内 (現在は未使用)
+          REPO=$(yq -r '.image.repository // ""' values-golden.yaml)
+          TAG=$(yq -r '.image.tag // ""' values-golden.yaml)
+          FILE_DIGEST=$(yq -r '.image.digest // ""' values-golden.yaml)
+          # 優先順位: workflow_dispatch 入力 image-digest > 環境変数 IMAGE_DIGEST > ファイル内 digest
           INPUT_DIGEST='${{ github.event.inputs.image-digest }}'
           ENV_DIGEST="${IMAGE_DIGEST:-}"
-          DIGEST="${INPUT_DIGEST:-${ENV_DIGEST:-}}"
+          DIGEST="${INPUT_DIGEST:-${ENV_DIGEST:-$FILE_DIGEST}}"
           if [[ -z "$REPO" ]]; then echo 'image.repository not set' >&2; exit 1; fi
           if [[ -n "$DIGEST" ]]; then
+            # プレーン 64hex の場合は sha256: を付与
+            if [[ "$DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              DIGEST="sha256:$DIGEST"
+            fi
             if [[ ! "$DIGEST" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
               echo "Provided digest format invalid: $DIGEST" >&2; exit 1
             fi
             IMAGE="${REPO}@${DIGEST}"
+            echo "Digest mode: $DIGEST"
           else
-            : "Using tag because digest placeholder or empty"
             [[ -n "$TAG" ]] || TAG=latest
             IMAGE="${REPO}:${TAG}"
+            echo "Tag mode: $TAG"
           fi
-          LABELS=$(yq -r '.env.cluster_dp_labels // empty' values-golden.yaml)
+          LABELS=$(yq -r '.env.cluster_dp_labels // ""' values-golden.yaml)
           echo "Computed IMAGE=$IMAGE"
           echo "Computed LABELS=$LABELS"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
