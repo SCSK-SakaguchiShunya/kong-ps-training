@@ -159,7 +159,12 @@ step_register_cert(){
       printf '%s\n' "$(echo "$cert_content" | head -n2)" "..." "$(echo "$cert_content" | tail -n2)"
     fi
   fi
-  CERT_ID=$(echo "$http_body" | jq -r '.id // empty')
+  # API 仕様差異対応: {"id":..} 形式 or {"item":{"id":..}} 形式を両対応
+  CERT_ID=$(echo "$http_body" | jq -r '.id // .item.id // empty')
+  if [[ -z "$CERT_ID" && $VERBOSE -eq 1 ]]; then
+    err "Could not find .id nor .item.id in response JSON. Full body (truncated 500 chars):"
+    printf '%s\n' "${http_body:0:500}"
+  fi
   if [[ -z "$CERT_ID" ]]; then
     # As fallback list certificates and pick the most recent (index 0) if any
     warn "Could not parse CERT_ID from create response; attempting fallback list"
@@ -171,6 +176,9 @@ step_register_cert(){
   fi
   [[ -n "$CERT_ID" ]] || die 12 "Certificate registration failed"
   log "Certificate ID: $CERT_ID"
+  if [[ $GITHUB_ACTIONS == true ]]; then
+    echo "::notice title=Konnect Certificate Registered::CERT_ID=$CERT_ID"
+  fi
   # Cache metadata
   echo "$CERT_ID" > "$CERT_ID_FILE"
   [[ -n $current_fpr ]] && echo "$current_fpr" > "$CERT_FPR_FILE"
