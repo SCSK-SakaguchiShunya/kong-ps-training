@@ -141,13 +141,13 @@ jobs:
                     --output text)
                   echo "Tag $tag digest $DIGEST" | tee -a "$SUMMARY_FILE"
 
-                  cat > "artifacts/values-image-$tag.yaml" <<EOF
-image:
-  repository: $ECR_REGISTRY/$ECR_REPOSITORY
-  tag: "$tag"
-  digest: "$DIGEST"
-  pullPolicy: IfNotPresent
-EOF
+                  {
+                    echo 'image:'
+                    echo "  repository: $ECR_REGISTRY/$ECR_REPOSITORY"
+                    echo "  tag: \"$tag\""
+                    echo "  digest: \"$DIGEST\""
+                    echo '  pullPolicy: IfNotPresent'
+                  } > "artifacts/values-image-$tag.yaml"
 
                 else
                   echo "push_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
@@ -155,17 +155,17 @@ EOF
                 fi
               else
                 echo "mirror_skipped $tag (scan-only mode)" | tee -a "$SUMMARY_FILE"
-                cat > "artifacts/values-image-$tag.yaml" <<EOF
-image:
-  repository: $BASE_IMAGE_REPO
-  tag: "$tag"
-  pullPolicy: IfNotPresent
-EOF
-                              fi
-                            fi
-                          done
+                {
+                  echo 'image:'
+                  echo "  repository: $BASE_IMAGE_REPO"
+                  echo "  tag: \"$tag\""
+                  echo '  pullPolicy: IfNotPresent'
+                } > "artifacts/values-image-$tag.yaml"
+              fi
+            fi
+          done
 
-                          echo "OVERALL_STATUS=$overall_status" >> "$GITHUB_ENV"
+          echo "OVERALL_STATUS=$overall_status" >> "$GITHUB_ENV"
 
       - name: Upload SARIF results
         if: always()
