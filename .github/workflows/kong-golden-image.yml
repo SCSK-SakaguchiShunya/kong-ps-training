@@ -50,7 +50,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Installing Trivy ${TRIVY_VERSION}"
-          curl -sSL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-6bit.tar.gz"
+          curl -sSL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
           tar zxvf trivy.tgz trivy >/dev/null 2>&1
           sudo mv trivy /usr/local/bin/
           trivy --version
