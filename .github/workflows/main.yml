@@ -25,30 +25,17 @@ permissions:
 
 jobs:
   trivy-scan:
-    name: Trivy Scan (Official Image)
+    name: Trivy Scan + Mirror
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        tag: ${{ fromJson(format('["{0}"]', github.event.inputs.tags || '3.11')) }}
+    timeout-minutes: 30
     steps:
-      - name: Prepare tags list (comma → matrix)
-        id: prep
+      - name: Normalize tags input
+        id: tags
         run: |
           INPUT="${{ github.event.inputs.tags || '3.11' }}"
-          # 余計な空白除去
-          LIST=$(echo "$INPUT" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | sort -u | paste -sd ',')
-          echo "list=$LIST" >> $GITHUB_OUTPUT
-        shell: bash
-
-      - name: Expand matrix dynamically
-        if: ${{ false }}
-        run: echo "(ダミーステップ: matrix は上部定義で処理)"
-
-      - name: Pull image
-        run: |
-          docker pull ${BASE_IMAGE_REPO}:${{ matrix.tag }}
+          LIST=$(echo "$INPUT" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | sort -u | paste -sd ' ')
+          echo "TAGS=$LIST" >> $GITHUB_ENV
+          echo "Normalized tags: $LIST"
 
       - name: Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -67,78 +54,62 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Restore Trivy cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.TRIVY_CACHE_DIR }}
-          key: trivy-${{ runner.os }}-${{ matrix.tag }}
-          restore-keys: |
-            trivy-${{ runner.os }}-
+      - name: Scan & Mirror loop
+        id: loop
+        env:
+          SEVERITY: ${{ github.event.inputs.severity_cutoff || 'HIGH,CRITICAL' }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          SUMMARY_FILE=scan-summary.txt
+          touch "$SUMMARY_FILE"
+          for tag in $TAGS; do
+            echo "--- Processing tag: $tag ---" | tee -a "$SUMMARY_FILE"
+            docker pull ${BASE_IMAGE_REPO}:$tag
+            # Trivy cache key (best effort)
+            echo "Scanning ${BASE_IMAGE_REPO}:$tag"
+            trivy image --ignore-unfixed --severity "$SEVERITY" --exit-code 1 \
+              --vuln-type os,library --cache-dir $TRIVY_CACHE_DIR ${BASE_IMAGE_REPO}:$tag | tee trivy-$tag.txt
+            # If exited non‑zero, script stops (set -e)
+            echo "Generating full SARIF for $tag" | tee -a "$SUMMARY_FILE"
+            trivy image --ignore-unfixed --format sarif --output trivy-$tag.sarif \
+              --vuln-type os,library --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+              --cache-dir $TRIVY_CACHE_DIR ${BASE_IMAGE_REPO}:$tag
+            # Mirror to ECR
+            DST=${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$tag
+            docker tag ${BASE_IMAGE_REPO}:$tag $DST
+            docker push $DST
+            DIGEST=$(aws ecr describe-images --repository-name $ECR_REPOSITORY --image-ids imageTag=$tag --query 'imageDetails[0].imageDigest' --output text)
+            echo "Tag $tag digest $DIGEST" | tee -a "$SUMMARY_FILE"
+            cat > artifacts/values-image-$tag.yaml <<EOF
+image:
+  repository: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY
+  tag: "$tag"
+  digest: "$DIGEST"
+  pullPolicy: IfNotPresent
+EOF
+          done
+          echo "ALL_TAGS=($TAGS)" >> $GITHUB_OUTPUT
 
-      - name: Trivy scan (fail on cutoff)
-        uses: aquasecurity/trivy-action@0.20.0
-        with:
-          image-ref: ${BASE_IMAGE_REPO}:${{ matrix.tag }}
-          format: 'table'
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
-          severity: ${{ github.event.inputs.severity_cutoff || 'HIGH,CRITICAL' }}
-          cache-dir: ${{ env.TRIVY_CACHE_DIR }}
-
-      - name: Generate SARIF (all severities)
-        if: always()
-        uses: aquasecurity/trivy-action@0.20.0
-        with:
-          image-ref: ${BASE_IMAGE_REPO}:${{ matrix.tag }}
-            
-          format: 'sarif'
-          output: trivy-${{ matrix.tag }}.sarif
-          ignore-unfixed: true
-          vuln-type: 'os,library'
-          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
-          cache-dir: ${{ env.TRIVY_CACHE_DIR }}
-
-      - name: Upload SARIF
+      - name: Upload SARIFs
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: trivy-${{ matrix.tag }}.sarif
+          sarif_file: trivy-3.11.sarif
+        continue-on-error: true
 
-      - name: Tag & Push to ECR (only if scan passed)
-        if: success()
-        run: |
-          MIRROR_TAG=${{ matrix.tag }}
-          SRC=${BASE_IMAGE_REPO}:${{ matrix.tag }}
-          DST=${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:${{ matrix.tag }}
-          docker tag "$SRC" "$DST"
-          docker push "$DST"
-          DIGEST=$(aws ecr describe-images --repository-name $ECR_REPOSITORY --image-ids imageTag=${{ matrix.tag }} --query 'imageDetails[0].imageDigest' --output text)
-          echo "DIGEST=$DIGEST" >> $GITHUB_ENV
-          echo "ECR_IMAGE=$DST" >> $GITHUB_ENV
-
-      - name: Generate values override (artifact)
-        if: success()
-        run: |
-          cat > values-image-${{ matrix.tag }}.yaml <<EOF
-          image:
-            repository: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY
-            tag: "${{ matrix.tag }}"
-            digest: "${DIGEST}"
-            pullPolicy: IfNotPresent
-          EOF
-
-      - name: Upload values artifact
+      - name: Upload values artifacts (bundle)
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: values-image-${{ matrix.tag }}
-          path: values-image-${{ matrix.tag }}.yaml
+          name: values-images
+          path: artifacts/
 
       - name: Summary
         if: always()
         run: |
-          echo "Tag: ${{ matrix.tag }} Scan Status: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ job.status }}" = "success" ]; then
-            echo "ECR Image: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:${{ matrix.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "Processed tags: $TAGS" >> $GITHUB_STEP_SUMMARY
+          if [ -f scan-summary.txt ]; then
+            echo '--- Scan Digest Summary ---' >> $GITHUB_STEP_SUMMARY
+            sed 's/^/  /' scan-summary.txt >> $GITHUB_STEP_SUMMARY
           fi
