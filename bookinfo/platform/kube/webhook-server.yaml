@@ -1,0 +1,189 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: konnect-webhook
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-server
+  namespace: konnect-webhook
+data:
+  server.py: |
+    import os, sys, signal, logging, gzip, zlib
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    GZIP_MAGIC = b'\x1f\x8b'
+
+    class Handler(BaseHTTPRequestHandler):
+        def _ok(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+        def _not_found(self):
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"not found\n")
+
+        def do_GET(self):
+            if self.path in ("/healthz", "/readyz"):
+                self._ok()
+            else:
+                self._not_found()
+
+        def _read_body(self):
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            return self.rfile.read(length) if length > 0 else b""
+
+        def _maybe_decompress(self, raw: bytes):
+            enc = (self.headers.get("Content-Encoding") or "").lower().strip()
+            # 明示ヘッダ優先、なければGZIPマジックで推測
+            try:
+                if "gzip" in enc or (raw.startswith(GZIP_MAGIC) and enc == ""):
+                    data = gzip.decompress(raw)
+                    logging.info("[decompress] applied=gzip size=%d->%d", len(raw), len(data))
+                    return data
+                if "deflate" in enc:
+                    try:
+                        data = zlib.decompress(raw)
+                    except zlib.error:
+                        # raw deflate も試す
+                        data = zlib.decompress(raw, -zlib.MAX_WBITS)
+                    logging.info("[decompress] applied=deflate size=%d->%d", len(raw), len(data))
+                    return data
+            except Exception as e:
+                logging.exception("decompression failed: %s", e)
+            # 未圧縮 or 失敗時はそのまま
+            logging.info("[decompress] applied=none size=%d", len(raw))
+            return raw
+
+        def do_POST(self):
+            if self.path != "/webhook":
+                self._not_found()
+                return
+
+            logging.info("[recv] %s %s", self.command, self.path)
+            for k, v in self.headers.items():
+                logging.info("[header] %s: %s", k, v)
+
+            raw = self._read_body()
+            body = self._maybe_decompress(raw)
+
+            # 本文を標準出力へ（UTF-8前提。読めないバイトは置換）
+            sys.stdout.write(body.decode("utf-8", errors="replace") + "\n")
+            sys.stdout.flush()
+
+            # 2xxを即返す（Konnectの再送を避ける）
+            self._ok()
+
+        # 標準アクセスログは抑制してloggingに流す
+        def log_message(self, fmt, *args):
+            logging.info("%s - %s", self.address_string(), fmt % args)
+
+    if __name__ == "__main__":
+        port = int(os.environ.get("PORT", "8080"))
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+        httpd = HTTPServer(("", port), Handler)
+
+        def _term(signum, frame):
+            logging.info("shutting down...")
+            httpd.shutdown()
+        signal.signal(signal.SIGTERM, _term)
+
+        logging.info("listening on :%d", port)
+        httpd.serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-server
+  namespace: konnect-webhook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webhook-server
+  template:
+    metadata:
+      labels:
+        app: webhook-server
+    spec:
+      containers:
+        - name: python
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+          command: ["python", "/app/server.py"]
+          volumeMounts:
+            - name: code
+              mountPath: /app
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+      volumes:
+        - name: code
+          configMap:
+            name: webhook-server
+            items:
+              - key: server.py
+                path: server.py
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-server
+  namespace: konnect-webhook
+spec:
+  selector:
+    app: webhook-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webhook-server
+  namespace: konnect-webhook
+spec:
+  rules:
+    - host: webhook.54.91.189.226.nip.io
+      http:
+        paths:
+          - path: /webhook
+            pathType: Prefix
+            backend:
+              service:
+                name: webhook-server
+                port:
+                  number: 80
+          - path: /healthz
+            pathType: Prefix
+            backend:
+              service:
+                name: webhook-server
+                port:
+                  number: 80
+          - path: /readyz
+            pathType: Prefix
+            backend:
+              service:
+                name: webhook-server
+                port:
+                  number: 80
