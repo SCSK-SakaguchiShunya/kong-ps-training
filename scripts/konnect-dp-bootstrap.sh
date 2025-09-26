@@ -8,6 +8,7 @@
 #     --labels "created-by:script,env:local" \
 #     --container-name konnect-dp \
 #     --ttl-seconds 0
+#     [--force-new-cert] [--cleanup-cert]
 #
 # In CI (GitHub Actions) set secret KONNECT_TOKEN and call the script.
 #
@@ -30,6 +31,12 @@ CONTAINER_NAME="konnect-dp-manual"
 TTL_SECONDS=0   # >0 の場合、その秒後にコンテナと証明書を削除
 CLEANUP_CERT=0  # 1 なら終了時に証明書削除
 VERBOSE=0
+FORCE_NEW_CERT=0
+
+# Metadata cache (to reuse previously registered certificate without re-posting)
+CERT_META_DIR="certs/meta"
+CERT_ID_FILE="${CERT_META_DIR}/cert_id"
+CERT_FPR_FILE="${CERT_META_DIR}/cert_fingerprint_sha256"
 
 log(){ echo "[INFO] $*"; }
 warn(){ echo "[WARN] $*" >&2; }
@@ -38,7 +45,7 @@ dbg(){ if [[ $VERBOSE -eq 1 ]]; then echo "[DBG] $*"; fi }
 
 die(){ err "$2"; exit "$1"; }
 
-usage(){ sed -n '1,60p' "$0" | grep -E '^#' | sed 's/^# ?//'; }
+usage(){ sed -n '1,70p' "$0" | grep -E '^#' | sed 's/^# ?//'; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -49,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --container-name) CONTAINER_NAME="$2"; shift 2;;
     --ttl-seconds) TTL_SECONDS="$2"; shift 2;;
     --cleanup-cert) CLEANUP_CERT=1; shift;;
+    --force-new-cert) FORCE_NEW_CERT=1; shift;;
     -v|--verbose) VERBOSE=1; shift;;
     -h|--help) usage; exit 0;;
     *) err "Unknown arg: $1"; usage; exit 1;;
@@ -65,6 +73,23 @@ CERT_PATH="${CERT_DIR}/tls.crt"
 CERT_ID="" # filled after registration
 
 mkdir -p "$CERT_DIR"
+mkdir -p "$CERT_META_DIR"
+
+fingerprint_cert(){
+  # Outputs SHA256 fingerprint (no colons) of current cert file
+  openssl x509 -noout -fingerprint -sha256 -in "$CERT_PATH" 2>/dev/null | awk -F= '{print $2}' | tr -d ':'
+}
+
+cached_cert_valid(){
+  [[ -f $CERT_ID_FILE && -f $CERT_FPR_FILE && -f $CERT_PATH ]] || return 1
+  local current_fpr cached_fpr
+  current_fpr=$(fingerprint_cert || true)
+  cached_fpr=$(cat "$CERT_FPR_FILE" 2>/dev/null || true)
+  [[ -n $current_fpr && $current_fpr == "$cached_fpr" ]] || return 1
+  CERT_ID=$(cat "$CERT_ID_FILE")
+  [[ -n $CERT_ID ]] || return 1
+  return 0
+}
 
 step_generate_certs(){
   if [[ -f $CERT_KEY_PATH && -f $CERT_PATH ]]; then
@@ -102,24 +127,53 @@ step_register_cert(){
     warn "Certificate content already contains literal \\n sequences (unexpected). Aborting to avoid invalid payload."
     die 12 "Certificate content malformed (contains literal \\n)"
   fi
+  # 1) Reuse cache if fingerprint matches and not forcing new
+  if [[ $FORCE_NEW_CERT -eq 0 ]] && cached_cert_valid; then
+    log "Reusing cached certificate (CERT_ID=$CERT_ID)"
+    return 0
+  fi
+
+  # 2) Try to find existing identical cert by enumerating (API has no direct search by hash)
+  local current_fpr list_resp match_id
+  current_fpr=$(fingerprint_cert || true)
+  if [[ -n $current_fpr && $FORCE_NEW_CERT -eq 0 ]]; then
+    list_resp=$(curl -sS -H "Authorization: Bearer $KONNECT_TOKEN" "${KONNECT_API}/control-planes/${CP_ID}/dp-client-certificates" || true)
+    # NOTE: API 仕様によっては cert の生本文を返さない可能性が高いため fingerprint 比較は不可。ID 再利用最小化のためスキップ。
+    dbg "Listed existing certificates count: $(echo "$list_resp" | jq -r '.data | length // 0')"
+  fi
+
+  # 3) Create new cert resource
   cert_json=$(jq -n --arg cert "$cert_content" '{cert:$cert}')
-  create_resp=$(curl -sS -X POST \
+  create_resp=$(curl -sS -w '\n%{http_code}' -X POST \
     -H "Authorization: Bearer $KONNECT_TOKEN" \
     -H "Content-Type: application/json" \
     -d "$cert_json" \
-    "${KONNECT_API}/control-planes/${CP_ID}/dp-client-certificates") || true
-  dbg "Cert create response: $create_resp"
-  # エラー詳細に pem-encoded-cert が含まれるかを検出し、ヒントを表示
-  if echo "$create_resp" | grep -qi 'pem-encoded-cert'; then
-    err "API reported PEM validation error. Check that the certificate is a single, valid PEM block without Windows CR or literal \\n."
+    "${KONNECT_API}/control-planes/${CP_ID}/dp-client-certificates" ) || true
+  local http_body http_code
+  http_body=$(echo "$create_resp" | sed '$d')
+  http_code=$(echo "$create_resp" | tail -n1)
+  dbg "Cert create HTTP $http_code body: $http_body"
+  if [[ $http_code != 2* && $http_code != 201 && $http_code != 200 ]]; then
+    if echo "$http_body" | grep -qi 'pem-encoded-cert'; then
+      err "PEM validation error from API. Dumping first/last lines for inspection:"
+      printf '%s\n' "$(echo "$cert_content" | head -n2)" "..." "$(echo "$cert_content" | tail -n2)"
+    fi
   fi
-  CERT_ID=$(echo "$create_resp" | jq -r '.id // empty')
+  CERT_ID=$(echo "$http_body" | jq -r '.id // empty')
   if [[ -z "$CERT_ID" ]]; then
-    warn "Could not parse CERT_ID (maybe already exists?). Listing certificates to attempt reuse."
-    CERT_ID=$(curl -sS -H "Authorization: Bearer $KONNECT_TOKEN" "${KONNECT_API}/control-planes/${CP_ID}/dp-client-certificates" | jq -r '.data[0].id // empty')
+    # As fallback list certificates and pick the most recent (index 0) if any
+    warn "Could not parse CERT_ID from create response; attempting fallback list"
+    match_id=$(curl -sS -H "Authorization: Bearer $KONNECT_TOKEN" "${KONNECT_API}/control-planes/${CP_ID}/dp-client-certificates" | jq -r '.data[0].id // empty')
+    if [[ -n $match_id ]]; then
+      CERT_ID=$match_id
+      warn "Using fallback CERT_ID=$CERT_ID"
+    fi
   fi
   [[ -n "$CERT_ID" ]] || die 12 "Certificate registration failed"
   log "Certificate ID: $CERT_ID"
+  # Cache metadata
+  echo "$CERT_ID" > "$CERT_ID_FILE"
+  [[ -n $current_fpr ]] && echo "$current_fpr" > "$CERT_FPR_FILE"
 }
 
 step_fetch_endpoints(){
