@@ -1,0 +1,40 @@
+# 既存 values.yaml から image セクションのみ差し替える例
+# 実運用では CI の成果物 (artifact) で生成された digest を反映
+image:
+  repository: 992757690863.dkr.ecr.ap-northeast-1.amazonaws.com/kong-gateway-mirror
+  tag: "3.11" # ワークフローでスキャン & ミラー済タグ
+  digest: "sha256:REPLACE_WITH_DIGEST_FROM_ARTIFACT" # GitHub Actions 成果物 values-image-3.11.yaml 参照
+  pullPolicy: IfNotPresent
+
+# そのほか既存設定 (抜粋: 必要なものをマージ)
+env:
+  role: data_plane
+  database: "off"
+  cluster_mtls: pki
+  cluster_control_plane: c2411eff6b.us.cp.konghq.com:443
+  cluster_dp_labels: "type:docker-kubernetesOS"
+  cluster_server_name: c2411eff6b.us.cp.konghq.com
+  cluster_telemetry_endpoint: c2411eff6b.us.tp.konghq.com:443
+  cluster_telemetry_server_name: c2411eff6b.us.tp.konghq.com
+  cluster_cert: /etc/secrets/kong-cluster-cert/tls.crt
+  cluster_cert_key: /etc/secrets/kong-cluster-cert/tls.key
+  lua_ssl_trusted_certificate: system
+  konnect_mode: "on"
+  vitals: "off"
+  nginx_worker_processes: "1"
+  upstream_keepalive_max_requests: "100000"
+  nginx_http_keepalive_requests: "100000"
+  proxy_access_log: "off"
+  dns_stale_ttl: "3600"
+  router_flavor: expressions
+
+resources:
+  requests:
+    cpu: 1
+    memory: 2Gi
+
+serviceMonitor:
+  enabled: true
+  annotations:
+    release: prometheus-stack
+# helm upgrade -i kong kong/kong -f values.yaml -f values-golden.yaml のようにレイヤード適用
