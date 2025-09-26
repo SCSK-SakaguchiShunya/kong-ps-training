@@ -55,21 +55,42 @@ jobs:
           sudo mv trivy /usr/local/bin/
           trivy --version
 
-      - name: Validate AWS role secret (enable scan-only fallback)
-        id: aws-role-check
+      - name: Detect AWS credentials method (role or keys)
+        id: aws-creds-detect
         run: |
-          if [ -z "${{ secrets.AWS_ROLE_TO_ASSUME }}" ]; then
-            echo "AWS_ROLE_TO_ASSUME secret is empty -> mirror will be skipped (scan-only mode)" >&2
-            echo "MIRROR_DISABLED=1" >> "$GITHUB_ENV"
-          else
+          set -euo pipefail
+          role='${{ secrets.AWS_ROLE_TO_ASSUME }}'
+          key='${{ secrets.AWS_ACCESS_KEY_ID }}'
+          sk='${{ secrets.AWS_SECRET_ACCESS_KEY }}'
+          if [ -n "$role" ]; then
+            echo "Using AWS OIDC Role assumption" >&2
+            echo "CREDS_METHOD=ROLE" >> "$GITHUB_ENV"
             echo "MIRROR_DISABLED=0" >> "$GITHUB_ENV"
+          elif [ -n "$key" ] && [ -n "$sk" ]; then
+            echo "Using static access keys" >&2
+            echo "CREDS_METHOD=KEYS" >> "$GITHUB_ENV"
+            echo "MIRROR_DISABLED=0" >> "$GITHUB_ENV"
+          else
+            echo "No AWS credentials (role nor access keys) -> mirror disabled (scan-only)" >&2
+            echo "CREDS_METHOD=NONE" >> "$GITHUB_ENV"
+            echo "MIRROR_DISABLED=1" >> "$GITHUB_ENV"
           fi
+          # セキュリティ: 値そのものは出力しない
 
-      - name: Configure AWS Credentials (OIDC)
-        if: env.MIRROR_DISABLED != '1'
+      - name: Configure AWS Credentials (OIDC Role)
+        if: env.CREDS_METHOD == 'ROLE'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure AWS Credentials (Access Keys)
+        if: env.CREDS_METHOD == 'KEYS'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Ensure ECR Repository
