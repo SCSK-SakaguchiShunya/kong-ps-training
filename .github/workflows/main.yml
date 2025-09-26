@@ -17,6 +17,7 @@ env:
   TRIVY_CACHE_DIR: .trivycache
   AWS_REGION: ap-northeast-1
   ECR_REPOSITORY: kong-gateway-mirror
+  TRIVY_VERSION: 0.54.1
 
 permissions:
   contents: read
@@ -45,12 +46,14 @@ jobs:
           restore-keys: |
             trivy-${{ runner.os }}-
 
-      - name: Install Trivy CLI
+      - name: Install Trivy CLI (tarball)
         run: |
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-          echo deb https://aquasecurity.github.io/trivy-repo/deb stable main | sudo tee /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update -y
-          sudo apt-get install -y trivy
+          set -euo pipefail
+          echo "Installing Trivy ${TRIVY_VERSION}"
+          curl -sSL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          tar zxvf trivy.tgz trivy >/dev/null 2>&1
+          sudo mv trivy /usr/local/bin/
+          trivy --version
 
       - name: Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
