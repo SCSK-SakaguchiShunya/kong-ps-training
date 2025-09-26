@@ -11,14 +11,6 @@ on:
         description: "Konnect region (us, eu, ... )"
         required: true
         default: us
-      image:
-        description: "Kong Gateway image"
-        required: true
-        default: kong/kong-gateway:3.9
-      labels:
-        description: "Labels for DP"
-        required: false
-        default: created-by:gha,env:ci
       ttl-seconds:
         description: "Auto remove container after seconds (0 to keep)"
         required: false
@@ -44,6 +36,35 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq
 
+      - name: Parse values-golden.yaml (image & labels)
+        id: parse-values
+        shell: bash
+        run: |
+          set -euo pipefail
+          YQ_VERSION="v4.44.3"
+          sudo wget -q https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64 -O /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+          test -f values-golden.yaml || { echo 'values-golden.yaml not found' >&2; exit 1; }
+          echo '--- values-golden.yaml (first 120 lines) ---'
+          sed -n '1,120p' values-golden.yaml
+          REPO=$(yq '.image.repository // empty' values-golden.yaml)
+          TAG=$(yq '.image.tag // empty' values-golden.yaml)
+          DIGEST=$(yq '.image.digest // empty' values-golden.yaml)
+          PLACEHOLDER="sha256:REPLACE_WITH_DIGEST_FROM_ARTIFACT"
+          if [[ -z "$REPO" ]]; then echo 'image.repository not set' >&2; exit 1; fi
+          if [[ -n "$DIGEST" && "$DIGEST" != "$PLACEHOLDER" ]]; then
+            IMAGE="${REPO}@${DIGEST}"
+          else
+            : "Using tag because digest placeholder or empty"
+            [[ -n "$TAG" ]] || TAG=latest
+            IMAGE="${REPO}:${TAG}"
+          fi
+          LABELS=$(yq -r '.env.cluster_dp_labels // empty' values-golden.yaml)
+          echo "Computed IMAGE=$IMAGE"
+          echo "Computed LABELS=$LABELS"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "labels=$LABELS" >> "$GITHUB_OUTPUT"
+
       - name: Login Docker Hub (optional)
         if: env.DOCKERHUB_USER && env.DOCKERHUB_TOKEN
         run: echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USER}" --password-stdin
@@ -53,11 +74,16 @@ jobs:
 
       - name: Run bootstrap script
         run: |
+          IMAGE_ARG="${{ steps.parse-values.outputs.image }}"
+          LABELS_ARG="${{ steps.parse-values.outputs.labels }}"
+          echo "Using only values-golden.yaml derived configuration"
+          echo "Using IMAGE_ARG=$IMAGE_ARG"
+          echo "Using LABELS_ARG=$LABELS_ARG"
           bash scripts/konnect-dp-bootstrap.sh \
             --cp-name "${{ github.event.inputs.cp-name || 'gm-sakaguchi-training' }}" \
             --region "${{ github.event.inputs.region || 'us' }}" \
-            --image "${{ github.event.inputs.image || 'kong/kong-gateway:3.9' }}" \
-            --labels "${{ github.event.inputs.labels || 'created-by:gha,env:ci' }}" \
+            --image "$IMAGE_ARG" \
+            --labels "$LABELS_ARG" \
             --container-name konnect-dp-ci \
             --ttl-seconds "${{ github.event.inputs.ttl-seconds || '0' }}" -v
 
