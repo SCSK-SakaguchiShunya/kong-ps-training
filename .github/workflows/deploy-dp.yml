@@ -1,0 +1,72 @@
+name: Konnect Data Plane Bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      cp-name:
+        description: "Control Plane (Runtime Group) name"
+        required: true
+        default: gm-sakaguchi-training
+      region:
+        description: "Konnect region (us, eu, ... )"
+        required: true
+        default: us
+      image:
+        description: "Kong Gateway image"
+        required: true
+        default: kong/kong-gateway:3.9
+      labels:
+        description: "Labels for DP"
+        required: false
+        default: created-by:gha,env:ci
+      ttl-seconds:
+        description: "Auto remove container after seconds (0 to keep)"
+        required: false
+        default: "0"
+  push:
+    paths:
+      - "scripts/konnect-dp-bootstrap.sh"
+      - ".github/workflows/konnect-dp-ci.yml"
+
+jobs:
+  bootstrap-dp:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      KONNECT_TOKEN: ${{ secrets.KONNECT_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (openssl,jq,docker already present)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Login Docker Hub (optional)
+        if: env.DOCKERHUB_USER && env.DOCKERHUB_TOKEN
+        run: echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USER}" --password-stdin
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Run bootstrap script
+        run: |
+          bash scripts/konnect-dp-bootstrap.sh \
+            --cp-name "${{ github.event.inputs.cp-name || 'gm-sakaguchi-training' }}" \
+            --region "${{ github.event.inputs.region || 'us' }}" \
+            --image "${{ github.event.inputs.image || 'kong/kong-gateway:3.9' }}" \
+            --labels "${{ github.event.inputs.labels || 'created-by:gha,env:ci' }}" \
+            --container-name konnect-dp-ci \
+            --ttl-seconds "${{ github.event.inputs.ttl-seconds || '0' }}" -v
+
+      - name: Show running containers
+        run: docker ps -a | grep konnect-dp-ci || true
+
+      - name: Tail logs (post)
+        run: docker logs --tail 200 konnect-dp-ci || true
+
+      - name: Optional cleanup (if ttl=0 user may keep container)
+        if: ${{ github.event.inputs.ttl-seconds == '0' }}
+        run: echo "Skipping automatic container removal; ttl=0"
