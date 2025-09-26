@@ -90,16 +90,29 @@ step_get_cp_id(){
 
 step_register_cert(){
   log "Registering Data Plane certificate"
-  local cert_json cert_content
-  cert_content=$(awk 'NF {sub(/\r/, ""); printf "%s\\n",$0;}' "$CERT_PATH")
+  local cert_json cert_content create_resp pem_first_line
+  # 誤り: 以前の実装は行ごとに "\\n" を埋め込み → API にはバックスラッシュ付き文字列が渡り validation error
+  # 正: ファイルの生の改行を保持したまま JSON へ (jq が自動で \n エスケープし API 側で復元される)
+  cert_content=$(tr -d '\r' < "$CERT_PATH")
+  pem_first_line=$(printf '%s' "$cert_content" | head -n1)
+  if [[ "$pem_first_line" != "-----BEGIN CERTIFICATE-----" ]]; then
+    warn "Certificate file does not start with PEM header; first line: $pem_first_line"
+  fi
+  if grep -q '\\n' <<< "$cert_content"; then
+    warn "Certificate content already contains literal \\n sequences (unexpected). Aborting to avoid invalid payload."
+    die 12 "Certificate content malformed (contains literal \\n)"
+  fi
   cert_json=$(jq -n --arg cert "$cert_content" '{cert:$cert}')
-  local create_resp
   create_resp=$(curl -sS -X POST \
     -H "Authorization: Bearer $KONNECT_TOKEN" \
     -H "Content-Type: application/json" \
     -d "$cert_json" \
     "${KONNECT_API}/control-planes/${CP_ID}/dp-client-certificates") || true
   dbg "Cert create response: $create_resp"
+  # エラー詳細に pem-encoded-cert が含まれるかを検出し、ヒントを表示
+  if echo "$create_resp" | grep -qi 'pem-encoded-cert'; then
+    err "API reported PEM validation error. Check that the certificate is a single, valid PEM block without Windows CR or literal \\n."
+  fi
   CERT_ID=$(echo "$create_resp" | jq -r '.id // empty')
   if [[ -z "$CERT_ID" ]]; then
     warn "Could not parse CERT_ID (maybe already exists?). Listing certificates to attempt reuse."
