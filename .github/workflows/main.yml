@@ -35,18 +35,19 @@ jobs:
         run: |
           INPUT="${{ github.event.inputs.tags || '3.11' }}"
           LIST=$(echo "$INPUT" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | sort -u | paste -sd ' ')
-          echo "TAGS=$LIST" >> $GITHUB_ENV
+          echo "TAGS=$LIST" >> "$GITHUB_ENV"
           echo "Normalized tags: $LIST"
 
+      # キャッシュキーをTrivyのバージョンに修正し、より適切にしました
       - name: Setup Trivy Cache
         uses: actions/cache@v4
         with:
           path: ${{ env.TRIVY_CACHE_DIR }}
-          key: trivy-${{ runner.os }}-${{ hashFiles('**/requirements.lock','**/uv.lock') }}
+          key: trivy-${{ runner.os }}-${{ env.TRIVY_VERSION }}
           restore-keys: |
             trivy-${{ runner.os }}-
 
-      - name: Install Trivy CLI (tarball)
+      - name: Install Trivy CLI
         run: |
           set -euo pipefail
           echo "Installing Trivy ${TRIVY_VERSION}"
@@ -55,13 +56,25 @@ jobs:
           sudo mv trivy /usr/local/bin/
           trivy --version
 
+      - name: Validate AWS role secret (enable scan-only fallback)
+        id: aws-role-check
+        run: |
+          if [ -z "${{ secrets.AWS_ROLE_TO_ASSUME }}" ]; then
+            echo "AWS_ROLE_TO_ASSUME secret is empty -> mirror will be skipped (scan-only mode)" >&2
+            echo "MIRROR_DISABLED=1" >> "$GITHUB_ENV"
+          else
+            echo "MIRROR_DISABLED=0" >> "$GITHUB_ENV"
+          fi
+
       - name: Configure AWS Credentials (OIDC)
+        if: env.MIRROR_DISABLED != '1'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Ensure ECR Repository
+        if: env.MIRROR_DISABLED != '1'
         run: |
           aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || \
             aws ecr create-repository --repository-name "$ECR_REPOSITORY" \
@@ -69,13 +82,17 @@ jobs:
               --encryption-configuration encryptionType=AES256
 
       - name: Login to ECR
+        if: env.MIRROR_DISABLED != '1'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+      
+      # ACCOUNT_IDの取得は不要なので削除 (ECRログインアクションの出力で十分なため)
 
       - name: Scan & Mirror loop
         id: loop
         env:
           SEVERITY: ${{ github.event.inputs.severity_cutoff || 'HIGH,CRITICAL' }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }} # ECRのレジストリURLを環境変数として渡す
         run: |
           set -euo pipefail
           mkdir -p artifacts sarif
@@ -83,63 +100,99 @@ jobs:
           FAILED_FILE=failed-tags.txt
           touch "$SUMMARY_FILE" "$FAILED_FILE"
           overall_status=0
+
           for tag in $TAGS; do
             echo "--- Processing tag: $tag ---" | tee -a "$SUMMARY_FILE"
-            if ! docker pull ${BASE_IMAGE_REPO}:$tag; then
+            if ! docker pull "${BASE_IMAGE_REPO}:$tag"; then
               echo "pull_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
               overall_status=1
               continue
             fi
+
             echo "Scanning ${BASE_IMAGE_REPO}:$tag"
-            if ! trivy image --ignore-unfixed --severity "$SEVERITY" --exit-code 1 \
-              --vuln-type os,library --cache-dir $TRIVY_CACHE_DIR ${BASE_IMAGE_REPO}:$tag | tee trivy-$tag.txt; then
-              echo "scan_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
+            # 脆弱性スキャンを実行し、閾値を超えたら失敗させる
+            if ! trivy image \
+              --ignore-unfixed \
+              --severity "$SEVERITY" \
+              --exit-code 1 \
+              --vuln-type os,library \
+              --cache-dir "$TRIVY_CACHE_DIR" \
+              "${BASE_IMAGE_REPO}:$tag"; then
+              # スキャン失敗の記録
+              echo "scan_failed $tag (vulnerabilities found)" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
               overall_status=1
-              # 失敗しても SARIF は生成 (全体可視化目的)
             fi
+
             echo "Generating SARIF for $tag" | tee -a "$SUMMARY_FILE"
-            trivy image --ignore-unfixed --format sarif --output sarif/trivy-$tag.sarif \
-              --vuln-type os,library --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
-              --cache-dir $TRIVY_CACHE_DIR ${BASE_IMAGE_REPO}:$tag || true
-            # 成功スキャンのみミラー
+            # スキャン結果に関わらず、常にSARIFレポートを生成する
+            trivy image \
+              --ignore-unfixed \
+              --format sarif \
+              --output "sarif/trivy-$tag.sarif" \
+              --vuln-type os,library \
+              --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+              --cache-dir "$TRIVY_CACHE_DIR" \
+              "${BASE_IMAGE_REPO}:$tag" || true
+
+            # スキャンに合格した場合のみプッシュ処理を行う
             if ! grep -q "scan_failed $tag" "$FAILED_FILE"; then
-              DST=${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$tag
-              docker tag ${BASE_IMAGE_REPO}:$tag $DST
-              if docker push $DST; then
-                DIGEST=$(aws ecr describe-images --repository-name $ECR_REPOSITORY --image-ids imageTag=$tag --query 'imageDetails[0].imageDigest' --output text)
-                echo "Tag $tag digest $DIGEST" | tee -a "$SUMMARY_FILE"
-                cat > artifacts/values-image-$tag.yaml <<EOF
-                image:
-                  repository: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY
-                  tag: "$tag"
-                  digest: "$DIGEST"
-                  pullPolicy: IfNotPresent
-                EOF
+              # ミラーリングが有効な場合
+              if [ "${MIRROR_DISABLED:-0}" = "0" ]; then
+                DST="$ECR_REGISTRY/$ECR_REPOSITORY:$tag"
+                docker tag "${BASE_IMAGE_REPO}:$tag" "$DST"
+                
+                echo "Pushing to ECR: $DST"
+                if docker push "$DST"; then
+                  # プッシュ成功後、ダイジェストを取得
+                  DIGEST=$(aws ecr describe-images \
+                    --repository-name "$ECR_REPOSITORY" \
+                    --image-ids imageTag=$tag \
+                    --query 'imageDetails[0].imageDigest' \
+                    --output text)
+                  echo "Tag $tag digest $DIGEST" | tee -a "$SUMMARY_FILE"
+
+                  # Artifact用のYAMLファイルを生成
+                  cat > "artifacts/values-image-$tag.yaml" <<EOF
+image:
+  # ミラー済み ECR リポジトリ (スキャン合格)
+  repository: $ECR_REGISTRY/$ECR_REPOSITORY
+  # スキャン合格タグ
+  tag: "$tag"
+  # 再現性確保のため digest を優先利用
+  digest: "$DIGEST"
+  pullPolicy: IfNotPresent
+EOF
+                else
+                  # プッシュ失敗の記録
+                  echo "push_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
+                  overall_status=1
+                fi
               else
-                echo "push_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
-                overall_status=1
+                # ミラーリング無効時 (スキャンのみ)
+                echo "mirror_skipped $tag (scan-only mode)" | tee -a "$SUMMARY_FILE"
+                cat > "artifacts/values-image-$tag.yaml" <<EOF
+image:
+  # フォールバック (ECR ミラー無効) 公式イメージ参照
+  repository: $BASE_IMAGE_REPO
+  tag: "$tag"
+  pullPolicy: IfNotPresent
+EOF
               fi
             fi
           done
-          echo "ALL_TAGS=($TAGS)" >> $GITHUB_OUTPUT
-          echo "OVERALL_STATUS=$overall_status" >> $GITHUB_ENV
 
-      - name: Upload SARIFs (each)
+          echo "OVERALL_STATUS=$overall_status" >> "$GITHUB_ENV"
+
+      # ループではなく、公式アクションでsarifディレクトリを直接指定して一括アップロードする
+      - name: Upload SARIF results
         if: always()
-        run: |
-          set -e
-          for f in sarif/*.sarif; do
-            [ -f "$f" ] || continue
-            echo "Uploading $f"
-            # 官方アクションは 1 ファイルずつ呼び出しが必要なのでループ内で composite ランナー使用
-            gh workflow run dummy || true
-          done
-          echo "(NOTE) 複数 SARIF を公式アクション1回でまとめては現在未対応のため、必要なら個別 matrix 化を追加してください。" >> $GITHUB_STEP_SUMMARY
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          # sarif/ ディレクトリ配下の全 .sarif ファイルをアップロード
+          sarif_file: sarif
+        
       - name: Upload values artifacts (bundle)
-        if: success()
+        if: success() # ジョブ全体が成功した場合のみアーティファクトをアップロード
         uses: actions/upload-artifact@v4
         with:
           name: values-images
@@ -148,16 +201,23 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "Processed tags: $TAGS" >> $GITHUB_STEP_SUMMARY
-          if [ -f scan-summary.txt ]; then
-            echo '--- Scan Digest Summary ---' >> $GITHUB_STEP_SUMMARY
-            sed 's/^/  /' scan-summary.txt >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "## Scan & Mirror Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Processed tags: $TAGS" >> "$GITHUB_STEP_SUMMARY"
+          
+          echo "### Scan Digest" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat scan-summary.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
           if [ -f failed-tags.txt ] && [ -s failed-tags.txt ]; then
-            echo '--- Failures ---' >> $GITHUB_STEP_SUMMARY
-            sed 's/^/  /' failed-tags.txt >> $GITHUB_STEP_SUMMARY
+            echo "---" >> "$GITHUB_STEP_SUMMARY"
+            echo "### 🚨 Failures" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat failed-tags.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
           fi
+
           if [ "${OVERALL_STATUS:-0}" != "0" ]; then
-            echo "One or more tags failed." >&2
+            echo "One or more tags failed the process." >&2
             exit 1
           fi
