@@ -15,6 +15,10 @@ on:
         description: "Auto remove container after seconds (0 to keep)"
         required: false
         default: "0"
+      image-digest:
+        description: "Optional sha256:<digest> (no quotes). If set, overrides tag and builds repo@digest image ref."
+        required: false
+        default: ""
   push:
     paths:
       - "scripts/konnect-dp-bootstrap.sh"
@@ -47,12 +51,17 @@ jobs:
           test -f values-golden.yaml || { echo 'values-golden.yaml not found' >&2; exit 1; }
           echo '--- values-golden.yaml (first 120 lines) ---'
           sed -n '1,120p' values-golden.yaml
-          REPO=$(yq eval '.image.repository // ""' values-golden.yaml)
-          TAG=$(yq eval '.image.tag // ""' values-golden.yaml)
-          DIGEST=$(yq eval '.image.digest // ""' values-golden.yaml)
-          PLACEHOLDER="sha256:REPLACE_WITH_DIGEST_FROM_ARTIFACT"
+          REPO=$(yq '.image.repository // empty' values-golden.yaml)
+          TAG=$(yq '.image.tag // empty' values-golden.yaml)
+          # 優先順位: workflow_dispatch 入力 image-digest > 環境変数 IMAGE_DIGEST > values-golden.yaml 内 (現在は未使用)
+          INPUT_DIGEST='${{ github.event.inputs.image-digest }}'
+          ENV_DIGEST="${IMAGE_DIGEST:-}"
+          DIGEST="${INPUT_DIGEST:-${ENV_DIGEST:-}}"
           if [[ -z "$REPO" ]]; then echo 'image.repository not set' >&2; exit 1; fi
-          if [[ -n "$DIGEST" && "$DIGEST" != "$PLACEHOLDER" ]]; then
+          if [[ -n "$DIGEST" ]]; then
+            if [[ ! "$DIGEST" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+              echo "Provided digest format invalid: $DIGEST" >&2; exit 1
+            fi
             IMAGE="${REPO}@${DIGEST}"
           else
             : "Using tag because digest placeholder or empty"
