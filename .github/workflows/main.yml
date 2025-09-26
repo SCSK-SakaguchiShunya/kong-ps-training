@@ -37,6 +37,21 @@ jobs:
           echo "TAGS=$LIST" >> $GITHUB_ENV
           echo "Normalized tags: $LIST"
 
+      - name: Setup Trivy Cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TRIVY_CACHE_DIR }}
+          key: trivy-${{ runner.os }}-${{ hashFiles('**/requirements.lock','**/uv.lock') }}
+          restore-keys: |
+            trivy-${{ runner.os }}-
+
+      - name: Install Trivy CLI
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb stable main | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -y
+          sudo apt-get install -y trivy
+
       - name: Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -60,43 +75,65 @@ jobs:
           SEVERITY: ${{ github.event.inputs.severity_cutoff || 'HIGH,CRITICAL' }}
         run: |
           set -euo pipefail
-          mkdir -p artifacts
+          mkdir -p artifacts sarif
           SUMMARY_FILE=scan-summary.txt
-          touch "$SUMMARY_FILE"
+          FAILED_FILE=failed-tags.txt
+          touch "$SUMMARY_FILE" "$FAILED_FILE"
+          overall_status=0
           for tag in $TAGS; do
             echo "--- Processing tag: $tag ---" | tee -a "$SUMMARY_FILE"
-            docker pull ${BASE_IMAGE_REPO}:$tag
-            # Trivy cache key (best effort)
+            if ! docker pull ${BASE_IMAGE_REPO}:$tag; then
+              echo "pull_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
+              overall_status=1
+              continue
+            fi
             echo "Scanning ${BASE_IMAGE_REPO}:$tag"
-            trivy image --ignore-unfixed --severity "$SEVERITY" --exit-code 1 \
-              --vuln-type os,library --cache-dir $TRIVY_CACHE_DIR ${BASE_IMAGE_REPO}:$tag | tee trivy-$tag.txt
-            # If exited non‑zero, script stops (set -e)
-            echo "Generating full SARIF for $tag" | tee -a "$SUMMARY_FILE"
-            trivy image --ignore-unfixed --format sarif --output trivy-$tag.sarif \
+            if ! trivy image --ignore-unfixed --severity "$SEVERITY" --exit-code 1 \
+              --vuln-type os,library --cache-dir $TRIVY_CACHE_DIR ${BASE_IMAGE_REPO}:$tag | tee trivy-$tag.txt; then
+              echo "scan_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
+              overall_status=1
+              # 失敗しても SARIF は生成 (全体可視化目的)
+            fi
+            echo "Generating SARIF for $tag" | tee -a "$SUMMARY_FILE"
+            trivy image --ignore-unfixed --format sarif --output sarif/trivy-$tag.sarif \
               --vuln-type os,library --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
-              --cache-dir $TRIVY_CACHE_DIR ${BASE_IMAGE_REPO}:$tag
-            # Mirror to ECR
-            DST=${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$tag
-            docker tag ${BASE_IMAGE_REPO}:$tag $DST
-            docker push $DST
-            DIGEST=$(aws ecr describe-images --repository-name $ECR_REPOSITORY --image-ids imageTag=$tag --query 'imageDetails[0].imageDigest' --output text)
-            echo "Tag $tag digest $DIGEST" | tee -a "$SUMMARY_FILE"
-            cat > artifacts/values-image-$tag.yaml <<EOF
-image:
-  repository: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY
-  tag: "$tag"
-  digest: "$DIGEST"
-  pullPolicy: IfNotPresent
-EOF
+              --cache-dir $TRIVY_CACHE_DIR ${BASE_IMAGE_REPO}:$tag || true
+            # 成功スキャンのみミラー
+            if ! grep -q "scan_failed $tag" "$FAILED_FILE"; then
+              DST=${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$tag
+              docker tag ${BASE_IMAGE_REPO}:$tag $DST
+              if docker push $DST; then
+                DIGEST=$(aws ecr describe-images --repository-name $ECR_REPOSITORY --image-ids imageTag=$tag --query 'imageDetails[0].imageDigest' --output text)
+                echo "Tag $tag digest $DIGEST" | tee -a "$SUMMARY_FILE"
+                cat > artifacts/values-image-$tag.yaml <<EOF
+                image:
+                  repository: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY
+                  tag: "$tag"
+                  digest: "$DIGEST"
+                  pullPolicy: IfNotPresent
+                EOF
+              else
+                echo "push_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
+                overall_status=1
+              fi
+            fi
           done
           echo "ALL_TAGS=($TAGS)" >> $GITHUB_OUTPUT
+          echo "OVERALL_STATUS=$overall_status" >> $GITHUB_ENV
 
-      - name: Upload SARIFs
+      - name: Upload SARIFs (each)
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-3.11.sarif
-        continue-on-error: true
+        run: |
+          set -e
+          for f in sarif/*.sarif; do
+            [ -f "$f" ] || continue
+            echo "Uploading $f"
+            # 官方アクションは 1 ファイルずつ呼び出しが必要なのでループ内で composite ランナー使用
+            gh workflow run dummy || true
+          done
+          echo "(NOTE) 複数 SARIF を公式アクション1回でまとめては現在未対応のため、必要なら個別 matrix 化を追加してください。" >> $GITHUB_STEP_SUMMARY
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload values artifacts (bundle)
         if: success()
@@ -112,4 +149,12 @@ EOF
           if [ -f scan-summary.txt ]; then
             echo '--- Scan Digest Summary ---' >> $GITHUB_STEP_SUMMARY
             sed 's/^/  /' scan-summary.txt >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f failed-tags.txt ] && [ -s failed-tags.txt ]; then
+            echo '--- Failures ---' >> $GITHUB_STEP_SUMMARY
+            sed 's/^/  /' failed-tags.txt >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "${OVERALL_STATUS:-0}" != "0" ]; then
+            echo "One or more tags failed." >&2
+            exit 1
           fi
