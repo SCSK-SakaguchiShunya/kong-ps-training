@@ -132,7 +132,6 @@ jobs:
               if [ "${MIRROR_DISABLED:-0}" = "0" ]; then
                 DST="$ECR_REGISTRY/$ECR_REPOSITORY:$tag"
                 docker tag "${BASE_IMAGE_REPO}:$tag" "$DST"
-                
                 echo "Pushing to ECR: $DST"
                 if docker push "$DST"; then
                   DIGEST=$(aws ecr describe-images \
@@ -143,12 +142,13 @@ jobs:
                   echo "Tag $tag digest $DIGEST" | tee -a "$SUMMARY_FILE"
 
                   cat > "artifacts/values-image-$tag.yaml" <<EOF
-image:
-  repository: $ECR_REGISTRY/$ECR_REPOSITORY
-  tag: "$tag"
-  digest: "$DIGEST"
-  pullPolicy: IfNotPresent
-EOF
+                    image:
+                      repository: $ECR_REGISTRY/$ECR_REPOSITORY
+                      tag: "$tag"
+                      digest: "$DIGEST"
+                      pullPolicy: IfNotPresent
+                    EOF
+
                 else
                   echo "push_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
                   overall_status=1
@@ -156,23 +156,23 @@ EOF
               else
                 echo "mirror_skipped $tag (scan-only mode)" | tee -a "$SUMMARY_FILE"
                 cat > "artifacts/values-image-$tag.yaml" <<EOF
-image:
-  repository: $BASE_IMAGE_REPO
-  tag: "$tag"
-  pullPolicy: IfNotPresent
-EOF
-              fi
-            fi
-          done
+                image:
+                  repository: $BASE_IMAGE_REPO
+                  tag: "$tag"
+                  pullPolicy: IfNotPresent
+                EOF
+                              fi
+                            fi
+                          done
 
-          echo "OVERALL_STATUS=$overall_status" >> "$GITHUB_ENV"
+                          echo "OVERALL_STATUS=$overall_status" >> "$GITHUB_ENV"
 
       - name: Upload SARIF results
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif
-        
+
       - name: Upload values artifacts (bundle)
         if: success()
         uses: actions/upload-artifact@v4
@@ -185,7 +185,7 @@ EOF
         run: |
           echo "## Scan & Mirror Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "Processed tags: $TAGS" >> "$GITHUB_STEP_SUMMARY"
-          
+
           echo "### Scan Digest" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           cat scan-summary.txt >> "$GITHUB_STEP_SUMMARY"
