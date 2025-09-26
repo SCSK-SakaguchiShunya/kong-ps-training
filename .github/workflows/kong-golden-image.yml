@@ -142,12 +142,12 @@ jobs:
                   echo "Tag $tag digest $DIGEST" | tee -a "$SUMMARY_FILE"
 
                   cat > "artifacts/values-image-$tag.yaml" <<EOF
-                    image:
-                      repository: $ECR_REGISTRY/$ECR_REPOSITORY
-                      tag: "$tag"
-                      digest: "$DIGEST"
-                      pullPolicy: IfNotPresent
-                    EOF
+image:
+  repository: $ECR_REGISTRY/$ECR_REPOSITORY
+  tag: "$tag"
+  digest: "$DIGEST"
+  pullPolicy: IfNotPresent
+EOF
 
                 else
                   echo "push_failed $tag" | tee -a "$FAILED_FILE" "$SUMMARY_FILE"
@@ -156,11 +156,11 @@ jobs:
               else
                 echo "mirror_skipped $tag (scan-only mode)" | tee -a "$SUMMARY_FILE"
                 cat > "artifacts/values-image-$tag.yaml" <<EOF
-                image:
-                  repository: $BASE_IMAGE_REPO
-                  tag: "$tag"
-                  pullPolicy: IfNotPresent
-                EOF
+image:
+  repository: $BASE_IMAGE_REPO
+  tag: "$tag"
+  pullPolicy: IfNotPresent
+EOF
                               fi
                             fi
                           done
