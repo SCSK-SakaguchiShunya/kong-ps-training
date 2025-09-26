@@ -29,6 +29,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      id-token: write # OIDC for AWS
     env:
       KONNECT_TOKEN: ${{ secrets.KONNECT_TOKEN }}
     steps:
@@ -79,6 +80,42 @@ jobs:
           echo "Computed LABELS=$LABELS"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
           echo "labels=$LABELS" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC) (optional)
+        if: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ap-northeast-1
+
+      - name: Configure AWS credentials (static keys fallback)
+        if: ${{ !secrets.AWS_ROLE_TO_ASSUME && secrets.AWS_ACCESS_KEY_ID && secrets.AWS_SECRET_ACCESS_KEY }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-1
+
+      - name: ECR Login (auto from repository)
+        if: steps.parse-values.outputs.image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_REF='${{ steps.parse-values.outputs.image }}'
+          # 抽出: <acct>.dkr.ecr.<region>.amazonaws.com
+          if [[ "$IMAGE_REF" =~ ^([0-9]{12})\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com ]]; then
+            ACCOUNT_ID="${BASH_REMATCH[1]}"
+            AWS_REGION="${BASH_REMATCH[2]}"
+            echo "Detected ECR registry ACCOUNT_ID=$ACCOUNT_ID REGION=$AWS_REGION"
+            if aws sts get-caller-identity >/dev/null 2>&1; then
+              aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+              echo "ECR login successful"
+            else
+              echo "WARNING: AWS credentials not configured; skipping ECR login. Pull may fail if repository is private." >&2
+            fi
+          else
+            echo "Image does not look like ECR registry; skipping ECR login: $IMAGE_REF"
+          fi
 
       - name: Login Docker Hub (optional)
         if: env.DOCKERHUB_USER && env.DOCKERHUB_TOKEN
